@@ -1,82 +1,95 @@
 import sys
+import torch_geometric.transforms as T
+import os.path as osp
+from torch_geometric.utils import to_networkx
+from torch_geometric.datasets import Planetoid, PPI, Amazon, Reddit, Coauthor, PPI, TUDataset
 import pdb
 import pickle as pkl
+from scipy.sparse import coo_matrix
 
 import torch
 import numpy as np
 import networkx as nx
 import scipy.sparse as sp
 
+def matching_labels_distribution(dataset):
+    # Build graph
+    adj = coo_matrix(
+        (np.ones(dataset[0].num_edges),
+        (dataset[0].edge_index[0].numpy(), dataset[0].edge_index[1].numpy())),
+        shape=(dataset[0].num_nodes, dataset[0].num_nodes))
+    G = nx.Graph(adj)
 
-def _load_data(dataset_str):
-    """Load data."""
+    hop_1_matching_percent = []
+    hop_2_matching_percent = []
+    hop_3_matching_percent = []
+    for n in range(dataset.data.num_nodes):
+        hop_1_neighbours = list(nx.ego_graph(G, n, 1).nodes())
+        hop_2_neighbours = list(nx.ego_graph(G, n, 2).nodes())
+        hop_3_neighbours = list(nx.ego_graph(G, n, 3).nodes())
+        node_label = dataset[0].y[n]
+        hop_1_labels = dataset[0].y[hop_1_neighbours]
+        hop_2_labels = dataset[0].y[hop_2_neighbours]
+        hop_3_labels = dataset[0].y[hop_3_neighbours]
+        matching_1_labels = node_label == hop_1_labels
+        matching_2_labels = node_label == hop_2_labels
+        matching_3_labels = node_label == hop_3_labels
+        hop_1_matching_percent.append(matching_1_labels.float().sum()/matching_1_labels.shape[0])
+        hop_2_matching_percent.append(matching_2_labels.float().sum()/matching_2_labels.shape[0])
+        hop_3_matching_percent.append(matching_3_labels.float().sum()/matching_3_labels.shape[0])
 
-    def parse_index_file(filename):
-        """Parse index file."""
-        index = []
-        for line in open(filename):
-            index.append(int(line.strip()))
-        return index
+    return hop_1_matching_percent, hop_2_matching_percent, hop_3_matching_percent
 
-    def sample_mask(idx, l):
-        """Create mask."""
-        mask = np.zeros(l)
-        mask[idx] = 1
-        return np.array(mask, dtype=np.bool)
 
-    names = ['x', 'y', 'tx', 'ty', 'allx', 'ally', 'graph']
-    objects = []
-    for i in range(len(names)):
-        with open("data/ind.{}.{}".format(dataset_str, names[i]), 'rb') as f:
-            if sys.version_info > (3, 0):
-                objects.append(pkl.load(f, encoding='latin1'))
-            else:
-                objects.append(pkl.load(f))
+def get_dataset(name, normalize_features=False, transform=None, edge_dropout=None, node_feature_dropout=None,
+                dissimilar_t = 1, cuda=False, permute_masks=None, lcc=False):
+    path = osp.join(osp.dirname(osp.realpath(__file__)), '..', 'data', name)
+    if name in ['Computers', 'Photo']:
+        dataset = Amazon(path, name)
+    elif name in ['Cora', 'CiteSeer', 'PubMed']:
+        dataset = Planetoid(path, name, split="full")
+    elif name in ['CS', 'Physics']:
+        dataset = Coauthor(path, name, split="full")
+    elif name in ['Reddit']:
+        dataset = Reddit(path)
+    if transform is not None and normalize_features:
+        dataset.transform = T.Compose([T.NormalizeFeatures(), transform])
+    elif normalize_features:
+        dataset.transform = T.NormalizeFeatures()
+    elif transform is not None:
+        dataset.transform = transform
 
-    x, y, tx, ty, allx, ally, graph = tuple(objects)
-    test_idx_reorder = parse_index_file(
-        "data/ind.{}.test.index".format(dataset_str))
-    test_idx_range = np.sort(test_idx_reorder)
+    if dissimilar_t < 1 and not permute_masks:
+        label_distributions = torch.tensor(matching_labels_distribution(dataset)).cpu()
+        dissimilar_neighbhour_train_mask = dataset[0]['train_mask']\
+            .logical_and(label_distributions[0] <= dissimilar_t)
+        dissimilar_neighbhour_val_mask = dataset[0]['val_mask']\
+            .logical_and(label_distributions[0] <= dissimilar_t)
+        dissimilar_neighbhour_test_mask = dataset[0]['test_mask']\
+            .logical_and(label_distributions[0] <= dissimilar_t)
+        dataset.data.train_mask = dissimilar_neighbhour_train_mask
+        dataset.data.val_mask = dissimilar_neighbhour_val_mask
+        dataset.data.test_mask = dissimilar_neighbhour_test_mask
 
-    if dataset_str == 'citeseer':
-        # Fix citeseer dataset (there are some isolated nodes in the graph)
-        # Find isolated nodes, add them as zero-vecs into the right position
-        test_idx_range_full = range(
-            min(test_idx_reorder), max(test_idx_reorder)+1)
-        tx_extended = sp.lil_matrix((len(test_idx_range_full), x.shape[1]))
-        tx_extended[test_idx_range-min(test_idx_range), :] = tx
-        tx = tx_extended
-        ty_extended = np.zeros((len(test_idx_range_full), y.shape[1]))
-        ty_extended[test_idx_range-min(test_idx_range), :] = ty
-        ty = ty_extended
+    lcc_mask = None
+    if lcc:  # select largest connected component
+        data_ori = dataset[0]
+        data_nx = to_networkx(data_ori)
+        data_nx = data_nx.to_undirected()
+        print("Original #nodes:", data_nx.number_of_nodes())
+        data_nx = data_nx.subgraph(max(nx.connected_components(data_nx), key=len))
+        print("#Nodes after lcc:", data_nx.number_of_nodes())
+        lcc_mask = list(data_nx.nodes)
 
-    features = sp.vstack((allx, tx)).tolil()
-    features[test_idx_reorder, :] = features[test_idx_range, :]
-    adj = nx.adjacency_matrix(nx.from_dict_of_lists(graph))
+    if permute_masks is not None:
+        label_distributions = torch.tensor(matching_labels_distribution(dataset)).cpu()
+        dataset.data = permute_masks(dataset.data, dataset.num_classes, lcc_mask=lcc_mask,
+                                     dissimilar_mask=(label_distributions[0] <= dissimilar_t))
 
-    labels = np.vstack((ally, ty))
-    labels[test_idx_reorder, :] = labels[test_idx_range, :]
+    if cuda:
+        dataset.data.to('cuda')
 
-    idx_test = test_idx_range.tolist()
-    idx_train = range(len(ally)-500)
-    idx_val = range(len(ally)-500, len(ally))
-    # idx_train = range(len(y))
-    # idx_val = range(len(y), len(y)+500)
-
-    train_mask = sample_mask(idx_train, labels.shape[0])
-    val_mask = sample_mask(idx_val, labels.shape[0])
-    test_mask = sample_mask(idx_test, labels.shape[0])
-
-    y_train = np.zeros(labels.shape)
-    y_val = np.zeros(labels.shape)
-    y_test = np.zeros(labels.shape)
-    y_train[train_mask, :] = labels[train_mask, :]
-    y_val[val_mask, :] = labels[val_mask, :]
-    y_test[test_mask, :] = labels[test_mask, :]
-
-    return (adj, features, y_train, y_val, y_test,
-            train_mask, val_mask, test_mask)
-
+    return dataset
 
 def nontuple_preprocess_features(features):
     """Row-normalize feature matrix and convert to tuple representation"""
@@ -100,27 +113,29 @@ def normalize_adj(adj):
 
 
 def nontuple_preprocess_adj(adj):
-    adj_normalized = normalize_adj(sp.eye(adj.shape[0]) + adj)
+    adj_normalized = normalize_adj(torch.eye(adj.shape[0]) + adj)
     # adj_normalized = sp.eye(adj.shape[0]) + normalize_adj(adj)
     return adj_normalized.tocsr()
 
 
-def load_data(dataset):
+def load_data(name):
     # train_mask, val_mask, test_mask: np.ndarray, [True/False] * node_number
-    adj, features, y_train, y_val, y_test, train_mask, val_mask, test_mask = \
-        _load_data(dataset)
+    dataset = get_dataset(name, normalize_features=True)
+    data = dataset[0]
     # pdb.set_trace()
-    train_index = np.where(train_mask)[0]
-    adj_train = adj[train_index, :][:, train_index]
-    y_train = y_train[train_index]
-    val_index = np.where(val_mask)[0]
-    y_val = y_val[val_index]
-    test_index = np.where(test_mask)[0]
-    y_test = y_test[test_index]
+    train_index = torch.where(data.train_mask)[0]
+
+    adj = torch.sparse_coo_tensor(data.edge_index, torch.ones(data.num_edges))
+    adj_train = adj.index_select(0, train_index).index_select(1, train_index)
+    y_train = data.y[train_index]
+    val_index = np.where(data.val_mask)[0]
+    y_val = data.y[val_index]
+    test_index = np.where(data.test_mask)[0]
+    y_test = data.y[test_index]
 
     num_train = adj_train.shape[0]
 
-    features = nontuple_preprocess_features(features).todense()
+    features = data.x
     train_features = features[train_index]
 
     norm_adj_train = nontuple_preprocess_adj(adj_train)
@@ -140,7 +155,7 @@ def load_data(dataset):
     # test_index = torch.LongTensor(test_index)
 
     return (norm_adj, features, norm_adj_train, train_features,
-            y_train, y_test, test_index)
+            y_train, y_val, y_test, train_index, val_index, test_index)
 
 
 def get_batches(train_ind, train_labels, batch_size=64, shuffle=True):
