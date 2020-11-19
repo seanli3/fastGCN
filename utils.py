@@ -3,9 +3,11 @@ import torch_geometric.transforms as T
 import os.path as osp
 from torch_geometric.utils import to_networkx
 from torch_geometric.datasets import Planetoid, PPI, Amazon, Reddit, Coauthor, PPI, TUDataset
+from webkb_data import WebKB
 import pdb
 import pickle as pkl
 from scipy.sparse import coo_matrix
+from torch_geometric.utils import is_undirected, to_undirected
 
 import torch
 import numpy as np
@@ -52,12 +54,18 @@ def get_dataset(name, normalize_features=False, transform=None, edge_dropout=Non
         dataset = Coauthor(path, name, split="full")
     elif name in ['Reddit']:
         dataset = Reddit(path)
+    elif name.lower() in ['cornell', 'texas', 'wisconsin']:
+        dataset = WebKB(path, name)
     if transform is not None and normalize_features:
         dataset.transform = T.Compose([T.NormalizeFeatures(), transform])
     elif normalize_features:
         dataset.transform = T.NormalizeFeatures()
     elif transform is not None:
         dataset.transform = transform
+
+    dataset.data.y = dataset.data.y.long()
+    if not is_undirected(dataset.data.edge_index):
+        dataset.data.edge_index = to_undirected(dataset.data.edge_index)
 
     if dissimilar_t < 1 and not permute_masks:
         label_distributions = torch.tensor(matching_labels_distribution(dataset)).cpu()
@@ -118,19 +126,19 @@ def nontuple_preprocess_adj(adj):
     return adj_normalized.tocsr()
 
 
-def load_data(name):
+def load_data(name, split=0):
     # train_mask, val_mask, test_mask: np.ndarray, [True/False] * node_number
     dataset = get_dataset(name, normalize_features=True)
     data = dataset[0]
     # pdb.set_trace()
-    train_index = torch.where(data.train_mask)[0]
+    train_index = torch.where(data.train_mask[split])[0]
 
-    adj = torch.sparse_coo_tensor(data.edge_index, torch.ones(data.num_edges))
+    adj = torch.sparse_coo_tensor(data.edge_index, torch.ones(data.num_edges), (data.num_nodes, data.num_nodes))
     adj_train = adj.index_select(0, train_index).index_select(1, train_index)
     y_train = data.y[train_index]
-    val_index = np.where(data.val_mask)[0]
+    val_index = np.where(data.val_mask[split])[0]
     y_val = data.y[val_index]
-    test_index = np.where(data.test_mask)[0]
+    test_index = np.where(data.test_mask[split])[0]
     y_test = data.y[test_index]
 
     num_train = adj_train.shape[0]
